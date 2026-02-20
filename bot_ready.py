@@ -95,28 +95,42 @@ def ask_gpt(prompt: str, timeout: int = 55) -> str:
 
 PROMPT_TEMPLATE = """Ты — модератор Telegram-канала интернет-магазина. Определи, является ли комментарий ВНЕШНИМ спамом — то есть продвижением ЧУЖИХ сервисов, каналов или схем заработка.
 
+## Канал/группа
+- название: {channel_title}
+
 ## Комментарий
 {text}
+
+## Метаданные сообщения
+- ответ на другое сообщение: {is_reply}
+- сущности в тексте: {entities}
 
 ## Профиль автора
 - username: @{username}
 - имя: {name}
 - био: {bio}
+- Telegram Premium: {is_premium}
+- фото профиля: {has_photo}
+- язык клиента: {language}
 
 ## Что считать спамом (ТОЛЬКО это)
-- Ссылки на ЧУЖИЕ Telegram-каналы, чаты, боты (t.me/...)
-- Продвижение ЧУЖИХ сервисов: крипта, трейдинг, ставки, казино, схемы заработка
-- Призывы подписаться на СТОРОННИЙ ресурс
+- Ссылки на Telegram-каналы, чаты, боты (t.me/...) с призывом переходить или подписываться
+- Продвижение сервисов, похожих на мошенничество: крипта, трейдинг, ставки, казино
 
 ## Что НЕ спам (важно!)
 - Промокоды, скидки, акции — это нормальная активность магазина и покупателей
 - Ссылки на маркетплейсы (Wildberries, Ozon, Яндекс Маркет и т.д.) — покупатели часто сравнивают цены
 - Упоминание цен, сравнение цен на разных площадках
-- Сообщения от админов канала и самого канала
+- Упоминание заработка без призыва к действию
 - Ссылки на юридическую информацию, оферты, политику конфиденциальности
 - Обычные комментарии: мнения, вопросы, благодарности, жалобы, отзывы
 - Упоминание собственного опыта покупки
 - Короткие реакции: «круто», «спасибо», эмодзи
+
+## Подсказки по метаданным
+- Отсутствие фото профиля и Premium — косвенный признак спам-аккаунта
+- Наличие url/text_link в сущностях при отсутствии ответа на сообщение — подозрительно
+- Ответ на чужое сообщение (is_reply=да) снижает вероятность спама
 
 Если сомневаешься — это НЕ спам. Помечай как спам только очевидное продвижение ЧУЖИХ ресурсов.
 
@@ -124,9 +138,22 @@ PROMPT_TEMPLATE = """Ты — модератор Telegram-канала инте�
 {{"spam": true/false, "confidence": 0.0-1.0, "reason": "краткая причина на русском"}}"""
 
 
-async def check_spam(text: str, username: str, name: str, bio: str) -> dict | None:
+async def check_spam(
+    text: str, username: str, name: str, bio: str,
+    *, is_premium: bool = False, has_photo: bool = False,
+    language: str = "не определён", entity_types: list[str] | None = None,
+    is_reply: bool = False, channel_title: str = "—",
+) -> dict | None:
     """Возвращает dict с полями spam/confidence/reason или None при ошибке GPT."""
-    prompt = PROMPT_TEMPLATE.format(text=text, username=username, name=name, bio=bio or "не указано")
+    prompt = PROMPT_TEMPLATE.format(
+        text=text, username=username, name=name, bio=bio or "не указано",
+        is_premium="да" if is_premium else "нет",
+        has_photo="да" if has_photo else "нет",
+        language=language,
+        entities=", ".join(entity_types) if entity_types else "нет",
+        is_reply="да" if is_reply else "нет",
+        channel_title=channel_title,
+    )
     try:
         logger.info("GPT запрос...")
         raw = await asyncio.to_thread(ask_gpt, prompt, 55)
@@ -152,21 +179,50 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = update.message
+
+    if msg.sender_chat:
+        return
+
     user = msg.from_user
+    if not user:
+        return
+
+    try:
+        member = await context.bot.get_chat_member(msg.chat.id, user.id)
+        if member.status in ("creator", "administrator"):
+            return
+    except TelegramError:
+        pass
+
     username = user.username or "нет"
     name = (f"{user.first_name or ''} {user.last_name or ''}".strip() or "—")
     text = msg.text
 
     bio = None
+    has_photo = False
     try:
-        chat = await context.bot.get_chat(user.id)
-        bio = getattr(chat, "bio", None)
+        chat_info = await context.bot.get_chat(user.id)
+        bio = getattr(chat_info, "bio", None)
+        has_photo = chat_info.photo is not None
     except Exception:
         pass
 
+    entity_types = [e.type for e in (msg.entities or [])]
+
     logger.info("@%s: %s...", username, text[:60])
 
-    result = await check_spam(text, username, name, bio)
+    result = await check_spam(
+        text=text,
+        username=username,
+        name=name,
+        bio=bio,
+        is_premium=user.is_premium or False,
+        has_photo=has_photo,
+        language=user.language_code or "не определён",
+        entity_types=entity_types,
+        is_reply=msg.reply_to_message is not None,
+        channel_title=msg.chat.title or "—",
+    )
     if result is None:
         logger.warning("GPT не ответил, пропускаем")
         return
