@@ -34,7 +34,6 @@ except Exception:
 # ── Конфигурация ─────────────────────────────────────────────
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHANNEL = os.environ.get("CHANNEL", "@lidsnvknevckwebcow9")
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 FOLDER_ID = os.environ["FOLDER_ID"]
 API_KEY = os.environ["API_KEY"]
@@ -180,7 +179,7 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = msg.chat.id
     msg_id = msg.message_id
-    cb_del = f"spam_del:{chat_id}:{msg_id}"[:64]
+    cb_del = f"spam_del:{chat_id}:{msg_id}:{user.id}"[:64]
 
     await context.bot.send_message(
         chat_id=ADMIN_ID,
@@ -194,7 +193,7 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("Пропустить", callback_data="spam_ok"),
-            InlineKeyboardButton("Удалить", callback_data=cb_del),
+            InlineKeyboardButton("Удалить и забанить", callback_data=cb_del),
         ]]),
     )
 
@@ -212,13 +211,21 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("spam_del:"):
-        parts = data.split(":", 2)
-        if len(parts) == 3:
+        parts = data.split(":")
+        if len(parts) >= 3:
             try:
-                await context.bot.delete_message(chat_id=int(parts[1]), message_id=int(parts[2]))
+                target_chat = int(parts[1])
+                target_msg = int(parts[2])
+                await context.bot.delete_message(chat_id=target_chat, message_id=target_msg)
                 logger.info("Удалён")
             except (ValueError, TelegramError) as e:
                 logger.error("Удаление: %s", e)
+            if len(parts) >= 4:
+                try:
+                    await context.bot.ban_chat_member(chat_id=target_chat, user_id=int(parts[3]))
+                    logger.info("Забанен: %s", parts[3])
+                except (ValueError, TelegramError) as e:
+                    logger.error("Бан: %s", e)
         try:
             await q.message.delete()
         except TelegramError:
@@ -244,7 +251,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_button, pattern="^spam_(del|ok)"))
     app.add_error_handler(on_error)
 
-    logger.info("Бот запущен, канал %s, порог %d%%", CHANNEL, SPAM_THRESHOLD * 100)
+    logger.info("Бот запущен, порог %d%%", SPAM_THRESHOLD * 100)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
