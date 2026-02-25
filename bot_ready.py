@@ -251,7 +251,7 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("Пропустить", callback_data="spam_ok"),
-            InlineKeyboardButton("Удалить и забанить", callback_data=cb_del),
+            InlineKeyboardButton("Удалить", callback_data=cb_del),
         ]]),
     )
 
@@ -278,12 +278,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.info("Удалён")
             except (ValueError, TelegramError) as e:
                 logger.error("Удаление: %s", e)
-            if len(parts) >= 4:
-                try:
-                    await context.bot.ban_chat_member(chat_id=target_chat, user_id=int(parts[3]))
-                    logger.info("Забанен: %s", parts[3])
-                except (ValueError, TelegramError) as e:
-                    logger.error("Бан: %s", e)
         try:
             await q.message.delete()
         except TelegramError:
