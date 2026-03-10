@@ -252,6 +252,15 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+async def handle_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if msg:
+        try:
+            await msg.delete()
+        except TelegramError:
+            pass
+
+
 async def on_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Ошибка: %s", context.error)
 
@@ -267,6 +276,10 @@ def main():
     app.add_handler(MessageHandler(
         filters.TEXT & (filters.ChatType.CHANNEL | filters.ChatType.SUPERGROUP),
         handle_comment,
+    ))
+    app.add_handler(MessageHandler(
+        filters.StatusUpdate.NEW_CHAT_MEMBERS,
+        handle_join,
     ))
     app.add_error_handler(on_error)
 
