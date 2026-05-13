@@ -17,13 +17,15 @@ from telegram.error import TelegramError
 
 # ── Логирование ──────────────────────────────────────────────
 
-logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 logger.propagate = False
+
 _fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
 _sh = logging.StreamHandler()
 _sh.setFormatter(_fmt)
 logger.addHandler(_sh)
+
 try:
     _fh = logging.FileHandler("bot.log", encoding="utf-8")
     _fh.setFormatter(_fmt)
@@ -33,17 +35,21 @@ except Exception:
 
 # ── Конфигурация ─────────────────────────────────────────────
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_ID = int(os.environ["ADMIN_ID"])
-FOLDER_ID = os.environ["FOLDER_ID"]
-API_KEY = os.environ["API_KEY"]
-SPAM_THRESHOLD = float(os.environ.get("SPAM_THRESHOLD", "0.7"))
+BOT_TOKEN   = os.environ["BOT_TOKEN"]
+ADMIN_ID    = int(os.environ["ADMIN_ID"])
+FOLDER_ID   = os.environ["FOLDER_ID"]
+API_KEY     = os.environ["API_KEY"]
+
+DELETE_CONFIDENCE  = 0.9   # удалять автоматически
+SUSPECT_CONFIDENCE = 0.6   # сообщать администратору
+
+LINK_ENTITY_TYPES = {"url", "text_link", "mention"}
 
 _SSL = ssl.create_default_context(cafile=certifi.where())
 
 # ── Yandex GPT ───────────────────────────────────────────────
 
-def _yandex_http(url, *, body=None, method="GET", timeout=30):
+def _yandex_http(url: str, *, body=None, method: str = "GET", timeout: int = 30) -> dict:
     headers = {"Authorization": f"Api-Key {API_KEY}", "x-folder-id": FOLDER_ID}
     raw = None
     if body is not None:
@@ -117,8 +123,6 @@ PROMPT_TEMPLATE = """Ты — модератор Telegram-канала инте�
 2. Рядом со ссылкой есть призыв или обещание из любой из этих категорий:
    - Заработок, доход, деньги («зарабатывай», «доход», «от X рублей в день», «без вложений»)
    - Крипта, трейдинг, ставки, казино
-   - Призыв перейти, написать, подписаться на сторонний канал/бот («пиши», «переходи», «подпишись»)
-   - Продвижение любого стороннего сервиса или канала
 
 Исключение: @yamarketaffbot — не спам.
 
@@ -145,14 +149,22 @@ confidence — уверенность, что это спам. При малей
 
 
 async def check_spam(
-    text: str, username: str, name: str,
-    *, is_premium: bool = False, has_photo: bool = False,
-    language: str = "не определён", entity_types: list[str] | None = None,
-    is_reply: bool = False, channel_title: str = "—",
+    text: str,
+    username: str,
+    name: str,
+    *,
+    is_premium: bool = False,
+    has_photo: bool = False,
+    language: str = "не определён",
+    entity_types: list[str] | None = None,
+    is_reply: bool = False,
+    channel_title: str = "—",
 ) -> dict | None:
     """Возвращает dict с полями spam/confidence/reason или None при ошибке GPT."""
     prompt = PROMPT_TEMPLATE.format(
-        text=text, username=username, name=name,
+        text=text,
+        username=username,
+        name=name,
         is_premium="да" if is_premium else "нет",
         has_photo="да" if has_photo else "нет",
         language=language,
@@ -168,17 +180,33 @@ async def check_spam(
         if not m:
             logger.error("GPT: нет JSON: %s", raw[:300])
             return None
-        cleaned = re.sub(r",\s*}", "}", m.group())
-        result = json.loads(cleaned)
+        result = json.loads(re.sub(r",\s*}", "}", m.group()))
         result.setdefault("confidence", 0.0)
         result.setdefault("reason", "")
         return result
-    except (json.JSONDecodeError, Exception) as e:
+    except Exception as e:
         logger.error("GPT: %s: %s", type(e).__name__, e)
         return None
 
 
 # ── Telegram ─────────────────────────────────────────────────
+
+async def _fetch_user_photo(bot, user_id: int) -> bool:
+    try:
+        chat = await bot.get_chat(user_id)
+        return chat.photo is not None
+    except Exception:
+        return False
+
+
+def _admin_text(label: str, confidence: float, username: str, text: str, reason: str) -> str:
+    return (
+        f"<b>{label} ({confidence:.0%})</b>\n\n"
+        f"<b>Автор:</b> @{username}\n"
+        f"<b>Текст:</b>\n{text}\n\n"
+        f"<b>Причина:</b> {reason or '—'}"
+    )
+
 
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -200,24 +228,17 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         pass
 
+    entity_types = [e.type for e in (msg.entities or [])]
+    if not any(e in LINK_ENTITY_TYPES for e in entity_types):
+        return
+
     username = user.username or "нет"
     name = (f"{user.first_name or ''} {user.last_name or ''}".strip() or "—")
     text = msg.text
 
-    has_photo = False
-    try:
-        chat_info = await context.bot.get_chat(user.id)
-        has_photo = chat_info.photo is not None
-    except Exception:
-        pass
-
-    entity_types = [e.type for e in (msg.entities or [])]
-
-    link_types = {"url", "text_link", "mention"}
-    if not any(e in link_types for e in entity_types):
-        return
-
     logger.info("@%s: %s...", username, text[:60])
+
+    has_photo = await _fetch_user_photo(context.bot, user.id)
 
     result = await check_spam(
         text=text,
@@ -238,49 +259,29 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     confidence = float(result.get("confidence", 0))
     logger.info("spam=%s confidence=%.0f%%", is_spam, confidence * 100)
 
-    if not is_spam or confidence < 0.6:
+    if not is_spam or confidence < SUSPECT_CONFIDENCE:
         return
 
-    chat_id = msg.chat.id
-    msg_id = msg.message_id
+    reason = result.get("reason", "—")
 
-    if confidence >= 0.9:
+    if confidence >= DELETE_CONFIDENCE:
         try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            await context.bot.delete_message(chat_id=msg.chat.id, message_id=msg.message_id)
             logger.info("Автоудалён спам от @%s", username)
         except TelegramError as e:
             logger.error("Автоудаление: %s", e)
-
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=(
-                f"<b>Спам удалён ({confidence:.0%})</b>\n\n"
-                f"<b>Автор:</b> @{username}\n"
-                f"<b>Текст:</b>\n{text}\n\n"
-                f"<b>Причина:</b> {result.get('reason', '—')}"
-            ),
-            parse_mode="HTML",
-        )
+        admin_text = _admin_text("Спам удалён", confidence, username, text, reason)
     else:
         logger.info("Сомнительное сообщение от @%s, не удалено", username)
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=(
-                f"<b>Не удалено — сомнительное ({confidence:.0%})</b>\n\n"
-                f"<b>Автор:</b> @{username}\n"
-                f"<b>Текст:</b>\n{text}\n\n"
-                f"<b>Причина:</b> {result.get('reason', '—')}"
-            ),
-            parse_mode="HTML",
-        )
+        admin_text = _admin_text("Не удалено — сомнительное", confidence, username, text, reason)
 
+    await context.bot.send_message(chat_id=ADMIN_ID, text=admin_text, parse_mode="HTML")
 
 
 async def handle_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if msg:
+    if update.message:
         try:
-            await msg.delete()
+            await update.message.delete()
         except TelegramError:
             pass
 
@@ -307,7 +308,8 @@ def main():
     ))
     app.add_error_handler(on_error)
 
-    logger.info("Бот запущен, порог %d%%", SPAM_THRESHOLD * 100)
+    logger.info("Бот запущен (удалять >= %.0f%%, уведомлять >= %.0f%%)",
+                DELETE_CONFIDENCE * 100, SUSPECT_CONFIDENCE * 100)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
