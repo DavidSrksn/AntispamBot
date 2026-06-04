@@ -13,7 +13,11 @@ import urllib.error
 import certifi
 from telegram import Message, Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
-from telegram.error import TelegramError
+from telegram.error import TelegramError, TimedOut
+from telegram.request import HTTPXRequest
+
+DELETE_RETRIES = 3
+DELETE_RETRY_DELAY = 2.0
 
 
 class _JoinServiceMessage(filters.MessageFilter):
@@ -218,6 +222,25 @@ def _admin_text(label: str, confidence: float, username: str, text: str, reason:
     )
 
 
+async def _delete_message_retry(bot, chat_id: int, message_id: int, *, label: str = "") -> bool:
+    prefix = f"{label}: " if label else ""
+    last_err = None
+    for attempt in range(1, DELETE_RETRIES + 1):
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+            return True
+        except TimedOut as e:
+            last_err = e
+            logger.warning("%sтаймаут удаления (%d/%d), чат %s", prefix, attempt, DELETE_RETRIES, chat_id)
+            if attempt < DELETE_RETRIES:
+                await asyncio.sleep(DELETE_RETRY_DELAY * attempt)
+        except TelegramError as e:
+            logger.error("%sошибка удаления в чате %s: %s", prefix, chat_id, e)
+            return False
+    logger.error("%sне удалось удалить в чате %s после %d попыток: %s", prefix, chat_id, DELETE_RETRIES, last_err)
+    return False
+
+
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -275,12 +298,12 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reason = result.get("reason", "—")
 
     if confidence >= DELETE_CONFIDENCE:
-        try:
-            await context.bot.delete_message(chat_id=msg.chat.id, message_id=msg.message_id)
+        deleted = await _delete_message_retry(context.bot, msg.chat.id, msg.message_id, label="Спам")
+        if deleted:
             logger.info("Автоудалён спам от @%s", username)
-        except TelegramError as e:
-            logger.error("Автоудаление: %s", e)
-        admin_text = _admin_text("Спам удалён", confidence, username, text, reason)
+            admin_text = _admin_text("Спам удалён", confidence, username, text, reason)
+        else:
+            admin_text = _admin_text("Не удалено — ошибка API", confidence, username, text, reason)
     else:
         logger.info("Сомнительное сообщение от @%s, не удалено", username)
         admin_text = _admin_text("Не удалено — сомнительное", confidence, username, text, reason)
@@ -292,15 +315,12 @@ async def handle_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg:
         return
-    try:
-        await msg.delete()
+    if await _delete_message_retry(context.bot, msg.chat.id, msg.message_id, label="Join"):
         logger.info(
             "Удалено join-сообщение, чат %s (участников в update: %d)",
             msg.chat.id,
             len(msg.new_chat_members or []),
         )
-    except TelegramError as e:
-        logger.error("Не удалось удалить join в чате %s: %s", msg.chat.id, e)
 
 
 async def on_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -314,7 +334,15 @@ def main():
         logger.error("Нет FOLDER_ID / API_KEY")
         return
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    req = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0, pool_timeout=30.0)
+    updates_req = HTTPXRequest(connect_timeout=30.0, read_timeout=35.0, write_timeout=30.0, pool_timeout=30.0)
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(req)
+        .get_updates_request(updates_req)
+        .build()
+    )
     app.add_handler(MessageHandler(
         filters.TEXT & (filters.ChatType.CHANNEL | filters.ChatType.SUPERGROUP),
         handle_comment,
