@@ -11,9 +11,19 @@ import urllib.request
 import urllib.error
 
 import certifi
-from telegram import Update
+from telegram import Message, Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from telegram.error import TelegramError
+
+
+class _JoinServiceMessage(filters.MessageFilter):
+    """Сервисное сообщение о входе в чат (в т.ч. new_chat_members=[] в крупных группах)."""
+
+    def filter(self, message: Message) -> bool:
+        return message.new_chat_members is not None
+
+
+JOIN_SERVICE = _JoinServiceMessage()
 
 # ── Логирование ──────────────────────────────────────────────
 
@@ -279,11 +289,18 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        try:
-            await update.message.delete()
-        except TelegramError:
-            pass
+    msg = update.effective_message
+    if not msg:
+        return
+    try:
+        await msg.delete()
+        logger.info(
+            "Удалено join-сообщение, чат %s (участников в update: %d)",
+            msg.chat.id,
+            len(msg.new_chat_members or []),
+        )
+    except TelegramError as e:
+        logger.error("Не удалось удалить join в чате %s: %s", msg.chat.id, e)
 
 
 async def on_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -303,7 +320,7 @@ def main():
         handle_comment,
     ))
     app.add_handler(MessageHandler(
-        filters.StatusUpdate.NEW_CHAT_MEMBERS,
+        JOIN_SERVICE & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
         handle_join,
     ))
     app.add_error_handler(on_error)
