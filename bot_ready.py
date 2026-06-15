@@ -54,7 +54,7 @@ ADMIN_ID    = int(os.environ["ADMIN_ID"])
 FOLDER_ID   = os.environ["FOLDER_ID"]
 API_KEY     = os.environ["API_KEY"]
 
-DELETE_CONFIDENCE  = 0.9   # удалять автоматически
+DELETE_CONFIDENCE  = 0.95  # удалять автоматически
 SUSPECT_CONFIDENCE = 0.6   # сообщать администратору
 
 LINK_ENTITY_TYPES = {"url", "text_link", "mention"}
@@ -140,10 +140,19 @@ PROMPT_TEMPLATE = """Ты — модератор Telegram-канала инте�
 
 Исключение: @yamarketaffbot — не спам.
 
+## Whitelist ссылок — НИКОГДА не спам
+Если в сообщении есть ссылка ТОЛЬКО на ресурсы из этого списка (без призыва к стороннему заработку/крипте/казино) — это НЕ спам:
+- Яндекс Маркет: market.yandex.ru, yandex.ru/market, yandex.ru/dev/market
+- Wildberries: wildberries.ru, wb.ru
+- Ozon: ozon.ru
+- ВКонтакте: vk.ru, vk.com
+- Внутренние ссылки на сообщения в этом же чате: t.me/c/...
+- Бот магазина: @yamarketaffbot, t.me/yamarketaffbot
+
 ## Однозначно НЕ спам (даже если кажется подозрительным):
 - Рассказ о своём заработке, доходе, опыте — БЕЗ ссылки
 - Просто ссылка без призыва («вот смотрел», «нашёл тут»)
-- Ссылки на маркетплейсы: Wildberries, Ozon, Яндекс Маркет и т.д.
+- Любые ссылки из whitelist выше
 - Промокоды, скидки, акции
 - Сравнение цен на разных площадках
 - Ссылки на юридические документы, оферты, политику конфиденциальности
@@ -152,8 +161,8 @@ PROMPT_TEMPLATE = """Ты — модератор Telegram-канала инте�
 - Ответ на чужое сообщение (is_reply=да) — почти всегда не спам
 
 ## Правило принятия решения:
-- confidence >= 0.9 и spam=true → удалить (очевидный спам, нет сомнений)
-- confidence 0.6–0.89 и spam=true → сомнительно, сообщить администратору без удаления
+- confidence >= 0.95 и spam=true → удалить (очевидный спам, нет сомнений)
+- confidence 0.6–0.94 и spam=true → сомнительно, сообщить администратору без удаления
 - всё остальное → не спам
 
 Ответь СТРОГО JSON без пояснений:
@@ -247,8 +256,16 @@ async def _delete_message_retry(bot, chat_id: int, message_id: int, *, label: st
     return False
 
 
+def _message_text_and_entities(msg: Message) -> tuple[str | None, list[str]]:
+    if msg.text:
+        return msg.text, [e.type for e in (msg.entities or [])]
+    if msg.caption:
+        return msg.caption, [e.type for e in (msg.caption_entities or [])]
+    return None, []
+
+
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+    if not update.message:
         return
 
     msg = update.message
@@ -267,13 +284,14 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError:
         pass
 
-    entity_types = [e.type for e in (msg.entities or [])]
+    text, entity_types = _message_text_and_entities(msg)
+    if not text:
+        return
     if not any(e in LINK_ENTITY_TYPES for e in entity_types):
         return
 
     username = user.username or "нет"
     name = (f"{user.first_name or ''} {user.last_name or ''}".strip() or "—")
-    text = msg.text
 
     logger.info("@%s: %s...", username, text[:60])
 
@@ -360,7 +378,7 @@ def main():
         .build()
     )
     app.add_handler(MessageHandler(
-        filters.TEXT & (filters.ChatType.CHANNEL | filters.ChatType.SUPERGROUP),
+        (filters.TEXT | filters.CAPTION) & (filters.ChatType.CHANNEL | filters.ChatType.SUPERGROUP),
         handle_comment,
     ))
     app.add_handler(MessageHandler(
