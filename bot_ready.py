@@ -18,6 +18,8 @@ from telegram.request import HTTPXRequest
 
 DELETE_RETRIES = 3
 DELETE_RETRY_DELAY = 2.0
+JOIN_DELETE_RETRIES = 8
+JOIN_DELETE_RETRY_DELAY = 5.0
 
 
 class _JoinServiceMessage(filters.MessageFilter):
@@ -344,16 +346,24 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=ADMIN_ID, text=admin_text, parse_mode="HTML")
 
 
+async def _delete_join_background(bot, chat_id: int, message_id: int) -> None:
+    """Фоновое удаление join-сообщения с расширенными повторами (сеть до Telegram нестабильна)."""
+    for attempt in range(1, JOIN_DELETE_RETRIES + 1):
+        if await _delete_message_retry(bot, chat_id, message_id, label="Join"):
+            logger.info("Удалено join-сообщение, чат %s, msg %s (попытка %d)", chat_id, message_id, attempt)
+            return
+        if attempt < JOIN_DELETE_RETRIES:
+            wait = JOIN_DELETE_RETRY_DELAY * attempt
+            logger.warning("Join: повтор %d/%d через %.0fс, чат %s", attempt, JOIN_DELETE_RETRIES, wait, chat_id)
+            await asyncio.sleep(wait)
+    logger.error("Join: не удалось удалить msg %s в чате %s после %d раундов", message_id, chat_id, JOIN_DELETE_RETRIES)
+
+
 async def handle_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg:
         return
-    if await _delete_message_retry(context.bot, msg.chat.id, msg.message_id, label="Join"):
-        logger.info(
-            "Удалено join-сообщение, чат %s (участников в update: %d)",
-            msg.chat.id,
-            len(msg.new_chat_members or []),
-        )
+    asyncio.create_task(_delete_join_background(context.bot, msg.chat.id, msg.message_id))
 
 
 async def on_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
