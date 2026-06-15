@@ -13,7 +13,7 @@ import urllib.error
 import certifi
 from telegram import Message, Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
-from telegram.error import TelegramError, TimedOut
+from telegram.error import TelegramError, TimedOut, RetryAfter
 from telegram.request import HTTPXRequest
 
 DELETE_RETRIES = 3
@@ -229,6 +229,12 @@ async def _delete_message_retry(bot, chat_id: int, message_id: int, *, label: st
         try:
             await bot.delete_message(chat_id=chat_id, message_id=message_id)
             return True
+        except RetryAfter as e:
+            last_err = e
+            wait = min(float(e.retry_after) + 1.0, 30.0)
+            logger.warning("%sфлуд-контроль удаления (%d/%d), ждём %.0fс, чат %s", prefix, attempt, DELETE_RETRIES, wait, chat_id)
+            if attempt < DELETE_RETRIES:
+                await asyncio.sleep(wait)
         except TimedOut as e:
             last_err = e
             logger.warning("%sтаймаут удаления (%d/%d), чат %s", prefix, attempt, DELETE_RETRIES, chat_id)
@@ -285,7 +291,16 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         channel_title=msg.chat.title or "—",
     )
     if result is None:
-        logger.warning("GPT не ответил, пропускаем")
+        logger.warning("GPT не ответил по @%s, уведомляем админа", username)
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "<b>⚠️ Не проверено — GPT не ответил</b>\n\n"
+                f"<b>Автор:</b> @{username}\n"
+                f"<b>Текст:</b>\n{text}"
+            ),
+            parse_mode="HTML",
+        )
         return
 
     is_spam = result.get("spam", False)
@@ -341,6 +356,7 @@ def main():
         .token(BOT_TOKEN)
         .request(req)
         .get_updates_request(updates_req)
+        .concurrent_updates(True)
         .build()
     )
     app.add_handler(MessageHandler(
