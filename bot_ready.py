@@ -1,5 +1,5 @@
 """Telegram-бот модерации комментариев через Yandex GPT."""
-
+в
 import asyncio
 import json
 import logging
@@ -22,11 +22,24 @@ JOIN_DELETE_RETRIES = 8
 JOIN_DELETE_RETRY_DELAY = 5.0
 
 
+def _has_user_content(message: Message) -> bool:
+    """Любой пользовательский контент — не сервисное join-сообщение."""
+    return bool(
+        message.text or message.caption or message.sticker or message.photo
+        or message.video or message.animation or message.document
+        or message.audio or message.voice or message.video_note
+    )
+
+
 class _JoinServiceMessage(filters.MessageFilter):
     """Сервисное сообщение о входе в чат (в т.ч. new_chat_members=[] в крупных группах)."""
 
     def filter(self, message: Message) -> bool:
-        return message.new_chat_members is not None
+        if message.new_chat_members is None:
+            return False
+        if _has_user_content(message):
+            return False
+        return True
 
 
 JOIN_SERVICE = _JoinServiceMessage()
@@ -272,6 +285,9 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = update.message
 
+    if msg.sticker or msg.animation or msg.video_note:
+        return
+
     if msg.sender_chat:
         return
 
@@ -361,7 +377,7 @@ async def _delete_join_background(bot, chat_id: int, message_id: int) -> None:
 
 async def handle_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    if not msg:
+    if not msg or _has_user_content(msg):
         return
     asyncio.create_task(_delete_join_background(context.bot, msg.chat.id, msg.message_id))
 
